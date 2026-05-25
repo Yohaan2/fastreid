@@ -1,0 +1,10 @@
+_BASE_: Base-bagtricks.yml
+
+MODEL:
+  BACKBONE:
+    PRETRAIN: False
+  DEVICE: cpu
+
+CUDNN_BENCHMARK: False
+
+OUTPUT_DIR: logs/person

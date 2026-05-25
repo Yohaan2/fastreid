@@ -1,0 +1,57 @@
+version: "3.9"
+
+services:
+  fastreid-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fastreid-service:latest
+    container_name: fastreid-service
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./weights:/app/weights:ro
+      - ./logs:/app/logs
+    expose:
+      - "8000"
+    networks:
+      - fastreid-net
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    # Descomentar cuando haya GPU NVIDIA disponible:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: fastreid-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      fastreid-service:
+        condition: service_healthy
+    networks:
+      - fastreid-net
+
+networks:
+  fastreid-net:
+    driver: bridge

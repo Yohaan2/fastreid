@@ -1,0 +1,12 @@
+.env
+weights/
+logs/
+nginx/certs/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+dist/
+build/
+*.egg-info/

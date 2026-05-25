@@ -1,0 +1,57 @@
+MODEL:
+  BACKBONE:
+    NAME: build_resnet_backbone
+    DEPTH: "50x"
+    LAST_STRIDE: 1
+    PRETRAIN: False
+    PRETRAIN_PATH: ""
+    WITH_IBN: True
+    WITH_SE: False
+    WITH_NL: False
+    NORM: "BN"
+  HEADS:
+    NAME: EmbeddingHead
+    NORM: BN
+    NUM_CLASSES: 0
+    POOL_LAYER: avgpool
+    NECK_FEAT: before
+    CLS_LAYER: linear
+  LOSSES:
+    NAME: ("CrossEntropyLoss",)
+
+INPUT:
+  SIZE_TRAIN: [256, 256]
+  SIZE_TEST: [256, 256]
+  PROB: 0.5
+  PADDING: 10
+  MIN_SCALE: 0.9
+  MAX_SCALE: 1.1
+  AUGMIX: False
+
+DATALOADER:
+  SAMPLER_TRAIN: TrainingSampler
+  NUM_INSTANCE: 4
+
+SOLVER:
+  AMP_PERIOD: 10
+  OPT: Adam
+  BASE_LR: 0.00035
+  WEIGHT_DECAY: 0.0005
+  WEIGHT_DECAY_NORM: 1e-4
+  BIAS_LR_FACTOR: 1.0
+  SCHED: WarmupMultiStepLR
+  MAX_EPOCH: 120
+  WARMUP_FACTOR: 0.01
+  WARMUP_ITERS: 2000
+  DELAY_EPOCHS: 40
+  EPOCH_MILESTONES: [80, 110]
+  GAMMA: 0.1
+  CHECKPOINT_PERIOD: 10
+
+TEST:
+  EVAL_PERIOD: 40
+  IMS_PER_BATCH: 256
+  METRIC: "cosine"
+  ROC_ENABLED: False
+
+OUTPUT_DIR: "logs/vehicle"
