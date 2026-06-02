@@ -201,28 +201,66 @@ class FastReIDService:
         Analiza una imagen completa, detecta personas, recorta cada una
         (crop temporal) y genera su embedding.
         """
+        t_total = time.perf_counter()
         detector = DetectionService.get_instance()
-        return self._detect_crop_embed(
+
+        # Etapa 1: Detección
+        t_det = time.perf_counter()
+        detections = detector.detect_persons(image)
+        det_ms = int((time.perf_counter() - t_det) * 1000)
+        logger.info("detection_stage", label="person", count=len(detections), detection_ms=det_ms)
+
+        # Etapa 2: Crop + Embedding
+        results, embed_ms = self._detect_crop_embed(
             image=image,
-            detections=detector.detect_persons(image),
+            detections=detections,
             model=self._person_model,
             transform=PERSON_TRANSFORM,
             label="person",
         )
+
+        total_ms = int((time.perf_counter() - t_total) * 1000)
+        logger.info(
+            "pipeline_total",
+            label="person",
+            detection_ms=det_ms,
+            embedding_ms=embed_ms,
+            total_ms=total_ms,
+        )
+        return results, total_ms
 
     def embed_vehicles_from_image(self, image: Image.Image) -> tuple[list[DetectedEmbedding], int]:
         """
         Analiza una imagen completa, detecta vehículos, recorta cada uno
         (crop temporal) y genera su embedding.
         """
+        t_total = time.perf_counter()
         detector = DetectionService.get_instance()
-        return self._detect_crop_embed(
+
+        # Etapa 1: Detección
+        t_det = time.perf_counter()
+        detections = detector.detect_vehicles(image)
+        det_ms = int((time.perf_counter() - t_det) * 1000)
+        logger.info("detection_stage", label="vehicle", count=len(detections), detection_ms=det_ms)
+
+        # Etapa 2: Crop + Embedding
+        results, embed_ms = self._detect_crop_embed(
             image=image,
-            detections=detector.detect_vehicles(image),
+            detections=detections,
             model=self._vehicle_model,
             transform=VEHICLE_TRANSFORM,
             label="vehicle",
         )
+
+        total_ms = int((time.perf_counter() - t_total) * 1000)
+        logger.info(
+            "pipeline_total",
+            label="vehicle",
+            detection_ms=det_ms,
+            embedding_ms=embed_ms,
+            total_ms=total_ms,
+        )
+        return results, total_ms
 
     def _detect_crop_embed(
         self,
@@ -238,18 +276,41 @@ class FastReIDService:
         t_start = time.perf_counter()
         rgb = image.convert("RGB") if image.mode != "RGB" else image
 
+        if not detections:
+            return [], 0
+
+        # Batch processing: recortar, preprocesar y apilar todos los crops
+        t_crop = time.perf_counter()
+        crops = [rgb.crop((det.x1, det.y1, det.x2, det.y2)) for det in detections]
+        crop_ms = int((time.perf_counter() - t_crop) * 1000)
+
+        # Preprocesar batch completo
+        t_preprocess = time.perf_counter()
+        tensors = []
+        for crop in crops:
+            if crop.mode != "RGB":
+                crop = crop.convert("RGB")
+            tensors.append(transform(crop))
+        
+        # Apilar en batch (N, C, H, W)
+        batch_tensor = torch.stack(tensors).to(self._device)
+        preprocess_ms = int((time.perf_counter() - t_crop) * 1000)
+
+        # Inferencia batch única
+        t_inference = time.perf_counter()
+        with torch.no_grad():
+            output = model(batch_tensor)
+        
+        features: torch.Tensor = output["features"] if isinstance(output, dict) else output
+        features = F.normalize(features, p=2, dim=1)
+        inference_ms = int((time.perf_counter() - t_inference) * 1000)
+
+        # Convertir a lista de embeddings
+        embeddings_list = features.cpu().tolist()
+
+        # Construir resultados
         results: list[DetectedEmbedding] = []
-        for det in detections:
-            # Crop temporal del objeto detectado
-            crop = rgb.crop((det.x1, det.y1, det.x2, det.y2))
-
-            embedding, _ = self._run_inference(
-                image=crop,
-                model=model,
-                transform=transform,
-                label=label,
-            )
-
+        for det, embedding in zip(detections, embeddings_list):
             results.append(
                 DetectedEmbedding(
                     bbox=(det.x1, det.y1, det.x2, det.y2),
@@ -263,7 +324,10 @@ class FastReIDService:
             "detect_crop_embed_ok",
             label=label,
             count=len(results),
-            processing_ms=elapsed_ms,
+            crop_ms=crop_ms,
+            preprocess_ms=preprocess_ms,
+            inference_ms=inference_ms,
+            total_ms=elapsed_ms,
         )
         return results, elapsed_ms
 

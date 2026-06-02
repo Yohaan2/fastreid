@@ -53,12 +53,13 @@ def build_inference_transform(height: int, width: int) -> transforms.Compose:
     """
     Construye el pipeline de transformación estándar para inferencia FastReID.
     PadToRatio → Resize → ToTensor → Normalize (ImageNet stats).
+    Usa BILINEAR para velocidad (BICUBIC es ~2x más lento con impacto mínimo en embeddings).
     """
     return transforms.Compose([
         PadToRatio(height, width),
         transforms.Resize(
             (height, width),
-            interpolation=transforms.InterpolationMode.BICUBIC,
+            interpolation=transforms.InterpolationMode.BILINEAR,
         ),
         transforms.ToTensor(),
         transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),

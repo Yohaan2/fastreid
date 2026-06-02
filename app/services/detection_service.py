@@ -142,6 +142,7 @@ class DetectionService:
             conf=settings.detection_confidence,
             iou=settings.detection_iou,
             classes=list(allowed_classes),
+            imgsz=320,  # Reducir resolución para velocidad (default 640)
             verbose=False,
         )
 
