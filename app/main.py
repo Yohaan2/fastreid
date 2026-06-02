@@ -10,6 +10,7 @@ from slowapi.util import get_remote_address
 from app.api.routes import embed, health
 from app.core.config import settings
 from app.core.logger import get_logger, setup_logging
+from app.services.detection_service import DetectionService
 from app.services.fastreid_service import FastReIDService
 
 setup_logging(settings.log_level)
@@ -25,10 +26,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """
     logger.info("service_startup", env=settings.app_env)
     FastReIDService.get_instance()
+    DetectionService.get_instance()
     logger.info(
         "service_ready",
         person_model=FastReIDService.get_instance().person_model_loaded,
         vehicle_model=FastReIDService.get_instance().vehicle_model_loaded,
+        detector=DetectionService.get_instance().model_loaded,
         device=str(FastReIDService.get_instance().device),
     )
     yield

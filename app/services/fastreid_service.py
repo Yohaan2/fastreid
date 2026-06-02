@@ -9,9 +9,12 @@ Responsabilidades:
 
 NO conoce: cámaras, eventos, usuarios, zonas, base de datos.
 """
+import base64
+import io
 import os
 import time
 import threading
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -20,6 +23,7 @@ from PIL import Image
 
 from app.core.config import settings
 from app.core.logger import get_logger
+from app.services.detection_service import Detection, DetectionService
 from app.services.preprocessing import (
     PERSON_TRANSFORM,
     VEHICLE_TRANSFORM,
@@ -29,6 +33,15 @@ from app.services.preprocessing import (
 logger = get_logger(__name__)
 
 _lock = threading.Lock()
+
+
+@dataclass
+class DetectedEmbedding:
+    """Resultado de detectar + recortar + embeber un único objeto."""
+
+    bbox: tuple[int, int, int, int]  # (x1, y1, x2, y2)
+    confidence: float
+    embedding: list[float]
 
 
 class FastReIDService:
@@ -178,6 +191,81 @@ class FastReIDService:
             transform=VEHICLE_TRANSFORM,
             label="vehicle",
         )
+
+    # ------------------------------------------------------------------
+    # Detección + crop temporal + embedding (imagen completa)
+    # ------------------------------------------------------------------
+
+    def embed_persons_from_image(self, image: Image.Image) -> tuple[list[DetectedEmbedding], int]:
+        """
+        Analiza una imagen completa, detecta personas, recorta cada una
+        (crop temporal) y genera su embedding.
+        """
+        detector = DetectionService.get_instance()
+        return self._detect_crop_embed(
+            image=image,
+            detections=detector.detect_persons(image),
+            model=self._person_model,
+            transform=PERSON_TRANSFORM,
+            label="person",
+        )
+
+    def embed_vehicles_from_image(self, image: Image.Image) -> tuple[list[DetectedEmbedding], int]:
+        """
+        Analiza una imagen completa, detecta vehículos, recorta cada uno
+        (crop temporal) y genera su embedding.
+        """
+        detector = DetectionService.get_instance()
+        return self._detect_crop_embed(
+            image=image,
+            detections=detector.detect_vehicles(image),
+            model=self._vehicle_model,
+            transform=VEHICLE_TRANSFORM,
+            label="vehicle",
+        )
+
+    def _detect_crop_embed(
+        self,
+        image: Image.Image,
+        detections: list[Detection],
+        model: Optional[torch.nn.Module],
+        transform,
+        label: str,
+    ) -> tuple[list[DetectedEmbedding], int]:
+        if model is None:
+            raise RuntimeError(f"Modelo {label} no disponible — pesos no cargados")
+
+        t_start = time.perf_counter()
+        rgb = image.convert("RGB") if image.mode != "RGB" else image
+
+        results: list[DetectedEmbedding] = []
+        for det in detections:
+            # Crop temporal del objeto detectado
+            crop = rgb.crop((det.x1, det.y1, det.x2, det.y2))
+
+            embedding, _ = self._run_inference(
+                image=crop,
+                model=model,
+                transform=transform,
+                label=label,
+            )
+
+            results.append(
+                DetectedEmbedding(
+                    bbox=(det.x1, det.y1, det.x2, det.y2),
+                    confidence=det.confidence,
+                    embedding=embedding,
+                )
+            )
+
+        elapsed_ms = int((time.perf_counter() - t_start) * 1000)
+        logger.info(
+            "detect_crop_embed_ok",
+            label=label,
+            count=len(results),
+            processing_ms=elapsed_ms,
+        )
+        return results, elapsed_ms
 
     # ------------------------------------------------------------------
     # Lógica de inferencia interna
