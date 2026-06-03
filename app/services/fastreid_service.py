@@ -128,12 +128,32 @@ class FastReIDService:
         config_path: str,
         weights_path: str,
         label: str,
-    ) -> Optional[torch.nn.Module]:
+    ) -> Optional[object]:
         """
-        Intenta cargar un modelo FastReID.
-        Si los pesos no existen, registra warning y retorna None (el servicio
-        seguirá levantando, pero ese endpoint devolverá 503).
+        Intenta cargar un modelo FastReID en formato ONNX con ONNX Runtime para máximo rendimiento en CPU.
+        Si no existe el archivo .onnx pero sí el .pth, lo convierte automáticamente de forma local.
         """
+        onnx_path = weights_path.replace(".pth", ".onnx")
+
+        # 1. Intentar cargar el modelo ONNX directamente con ONNX Runtime
+        if os.path.exists(onnx_path):
+            try:
+                import onnxruntime as ort
+                logger.info("loading_onnx_model", label=label, path=onnx_path)
+
+                # Optimización de hilos para CPU en ONNX Runtime
+                sess_options = ort.SessionOptions()
+                sess_options.intra_op_num_threads = 1  # Forzar 1 hilo para evitar sobrecargas, se puede ampliar si vCPU > 1
+                sess_options.inter_op_num_threads = 1
+                sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+                session = ort.InferenceSession(onnx_path, sess_options, providers=["CPUExecutionProvider"])
+                logger.info("onnx_model_loaded", label=label, path=onnx_path)
+                return session
+            except Exception as exc:
+                logger.error("onnx_load_error_falling_back_to_pytorch", label=label, error=str(exc))
+
+        # 2. Si no existe ONNX, verificar si al menos existe el .pth para convertirlo
         if not os.path.exists(weights_path):
             logger.warning(
                 "model_weights_not_found",
@@ -142,37 +162,111 @@ class FastReIDService:
             )
             return None
 
+        # 3. Cargar con PyTorch y exportar a ONNX al vuelo
         try:
             from fastreid.config import get_cfg
             from fastreid.modeling.meta_arch import build_model
             from fastreid.utils.checkpoint import Checkpointer
 
+            logger.info("loading_pytorch_model_for_onnx_export", label=label, path=weights_path)
             cfg = get_cfg()
             cfg.merge_from_file(config_path)
             cfg.MODEL.WEIGHTS = weights_path
             cfg.MODEL.BACKBONE.PRETRAIN = False
-            cfg.MODEL.DEVICE = str(self._device)
+            cfg.MODEL.DEVICE = "cpu"  # Exportar siempre en CPU
             cfg.CUDNN_BENCHMARK = False
             cfg.freeze()
 
             model = build_model(cfg)
             Checkpointer(model).load(weights_path)
             model.eval()
-            model.to(self._device)
 
-            logger.info("model_loaded", label=label, device=str(self._device))
-            return model
+            # Determinar dimensiones correctas según el modelo
+            from app.services.preprocessing import PERSON_HEIGHT, PERSON_WIDTH, VEHICLE_HEIGHT, VEHICLE_WIDTH
+            height = PERSON_HEIGHT if label == "person" else VEHICLE_HEIGHT
+            width = PERSON_WIDTH if label == "person" else VEHICLE_WIDTH
+
+            # Exportar a ONNX
+            success = self._export_to_onnx(model, onnx_path, height, width)
+
+            # Liberar modelo PyTorch de la memoria RAM inmediatamente
+            import gc
+            del model
+            gc.collect()
+
+            if success and os.path.exists(onnx_path):
+                import onnxruntime as ort
+                sess_options = ort.SessionOptions()
+                sess_options.intra_op_num_threads = 1
+                sess_options.inter_op_num_threads = 1
+                sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+                session = ort.InferenceSession(onnx_path, sess_options, providers=["CPUExecutionProvider"])
+                logger.info("onnx_model_loaded_after_export", label=label, path=onnx_path)
+                return session
+
+            raise RuntimeError("La exportación a ONNX falló o no se generó el archivo")
 
         except ImportError:
             logger.warning(
-                "fastreid_not_installed",
+                "fastreid_not_installed_for_export",
                 label=label,
-                hint="Instalar FastReID: pip install -e /opt/fast-reid",
+                hint="Se requiere FastReID instalado para exportar el .pth original a .onnx: pip install -e /opt/fast-reid",
             )
             return None
         except Exception as exc:
-            logger.error("model_load_error", label=label, error=str(exc))
+            logger.error("pytorch_load_or_export_error", label=label, error=str(exc))
             return None
+
+    def _export_to_onnx(self, model: torch.nn.Module, onnx_path: str, height: int, width: int) -> bool:
+        """
+        Exporta de forma limpia un modelo PyTorch de FastReID a ONNX.
+        Usa un wrapper para simplificar la salida eliminando diccionarios.
+        """
+        try:
+            logger.info("exporting_to_onnx_started", path=onnx_path, height=height, width=width)
+
+            # Wrapper para forzar que el grafo ONNX solo retorne el tensor plano de features
+            class FastReIDONNXWrapper(torch.nn.Module):
+                def __init__(self, m):
+                    super().__init__()
+                    self.m = m
+
+                def forward(self, x):
+                    output = self.m(x)
+                    if isinstance(output, dict):
+                        return output["features"]
+                    return output
+
+            wrapper = FastReIDONNXWrapper(model)
+            wrapper.eval()
+
+            # Tensor dummy para trazar la estructura
+            dummy_input = torch.zeros(1, 3, height, width, device=torch.device("cpu"))
+
+            # Asegurar directorio de destino
+            os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
+
+            # Exportación robusta con batch size dinámico
+            torch.onnx.export(
+                wrapper,
+                dummy_input,
+                onnx_path,
+                export_params=True,
+                opset_version=11,
+                do_constant_folding=True,
+                input_names=["input"],
+                output_names=["output"],
+                dynamic_axes={
+                    "input": {0: "batch_size"},
+                    "output": {0: "batch_size"},
+                },
+            )
+            logger.info("exporting_to_onnx_completed", path=onnx_path)
+            return True
+        except Exception as exc:
+            logger.error("exporting_to_onnx_failed", path=onnx_path, error=str(exc))
+            return False
 
     # ------------------------------------------------------------------
     # Estado del servicio
@@ -182,13 +276,13 @@ class FastReIDService:
     def person_model_loaded(self) -> bool:
         if self._person_model is not None:
             return True
-        return os.path.exists(settings.model_path_person)
+        return os.path.exists(settings.model_path_person) or os.path.exists(settings.model_path_person.replace(".pth", ".onnx"))
 
     @property
     def vehicle_model_loaded(self) -> bool:
         if self._vehicle_model is not None:
             return True
-        return os.path.exists(settings.model_path_vehicle)
+        return os.path.exists(settings.model_path_vehicle) or os.path.exists(settings.model_path_vehicle.replace(".pth", ".onnx"))
 
     @property
     def gpu_available(self) -> bool:
@@ -257,7 +351,7 @@ class FastReIDService:
         self,
         image: Image.Image,
         detections: list[Detection],
-        model: Optional[torch.nn.Module],
+        model: Optional[object],
         transform,
         label: str,
     ) -> tuple[list[DetectedEmbedding], int]:
@@ -282,16 +376,27 @@ class FastReIDService:
                 crop = crop.convert("RGB")
             tensors.append(transform(crop))
         
-        # Apilar en batch (N, C, H, W) y mover al device
-        batch_tensor = torch.stack(tensors).to(self._device)
+        # Apilar en batch (N, C, H, W)
+        batch_tensor = torch.stack(tensors)
         preprocess_ms = int((time.perf_counter() - t_crop) * 1000)
 
         # Inferencia batch única ultrarrápida
         t_inference = time.perf_counter()
-        with torch.inference_mode():
-            output = model(batch_tensor)
         
-        features: torch.Tensor = output["features"] if isinstance(output, dict) else output
+        import onnxruntime as ort
+        if isinstance(model, ort.InferenceSession):
+            input_data = batch_tensor.numpy()
+            input_name = model.get_inputs()[0].name
+            output_name = model.get_outputs()[0].name
+            
+            ort_outputs = model.run([output_name], {input_name: input_data})
+            features = torch.from_numpy(ort_outputs[0])
+        else:
+            batch_tensor = batch_tensor.to(self._device)
+            with torch.inference_mode():
+                output = model(batch_tensor)
+            features = output["features"] if isinstance(output, dict) else output
+        
         features = F.normalize(features, p=2, dim=1)
         inference_ms = int((time.perf_counter() - t_inference) * 1000)
 
@@ -328,7 +433,7 @@ class FastReIDService:
     def _run_inference(
         self,
         image: Image.Image,
-        model: Optional[torch.nn.Module],
+        model: Optional[object],
         transform,
         label: str,
     ) -> tuple[list[float], int]:
@@ -337,13 +442,22 @@ class FastReIDService:
 
         t_start = time.perf_counter()
 
-        tensor = preprocess_image(image, transform, self._device)
-
-        with torch.inference_mode():
-            output = model(tensor)
-
-        # FastReID puede retornar dict o tensor directo según la config
-        features: torch.Tensor = output["features"] if isinstance(output, dict) else output
+        import onnxruntime as ort
+        if isinstance(model, ort.InferenceSession):
+            # ONNX Runtime - no requiere device GPU/CPU, preprocesar en CPU
+            tensor = preprocess_image(image, transform, torch.device("cpu"))
+            input_data = tensor.numpy()
+            input_name = model.get_inputs()[0].name
+            output_name = model.get_outputs()[0].name
+            
+            ort_outputs = model.run([output_name], {input_name: input_data})
+            features = torch.from_numpy(ort_outputs[0])
+        else:
+            # PyTorch
+            tensor = preprocess_image(image, transform, self._device)
+            with torch.inference_mode():
+                output = model(tensor)
+            features = output["features"] if isinstance(output, dict) else output
 
         raw_norm = features.norm(p=2, dim=1).item()
         logger.debug(

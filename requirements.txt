@@ -14,6 +14,7 @@ slowapi==0.1.9
 # Deep learning
 torch==2.3.0
 torchvision==0.18.0
+onnxruntime==1.17.3
 
 # Detección de objetos (personas / vehículos) — equivalente a InsightFace
 ultralytics==8.2.0
