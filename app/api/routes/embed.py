@@ -33,12 +33,11 @@ def _to_detection_schema(item: DetectedEmbedding) -> DetectionEmbedding:
 
 @router.post(
     "/embed/person",
-    response_model=MultiEmbeddingResponse,
+    response_model=EmbeddingResponse,
     status_code=status.HTTP_200_OK,
-    summary="Detectar personas y generar embeddings",
+    summary="Generar embedding de persona",
     description=(
-        "Recibe una imagen completa (multipart/form-data), detecta todas las personas, "
-        "realiza un crop temporal de cada una y retorna su embedding visual. "
+        "Recibe un crop de persona (multipart/form-data) y retorna su embedding visual. "
         "Requiere header `x-api-key`."
     ),
     tags=["Embeddings"],
@@ -47,9 +46,9 @@ def _to_detection_schema(item: DetectedEmbedding) -> DetectionEmbedding:
 @limiter.limit(settings.rate_limit_embed)
 async def embed_person(
     request: Request,
-    image: UploadFile = File(..., description="Imagen completa a analizar (JPEG/PNG/WebP, máx 5MB)"),
+    image: UploadFile = File(..., description="Imagen recortada de la persona (JPEG/PNG/WebP, máx 5MB)"),
     service: FastReIDService = Depends(get_fastreid_service),
-) -> MultiEmbeddingResponse:
+) -> EmbeddingResponse:
     if not service.person_model_loaded:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -67,37 +66,36 @@ async def embed_person(
         ) from exc
 
     try:
-        detected, elapsed_ms = service.embed_persons_from_image(pil_image)
+        embedding, elapsed_ms = service.embed_person(pil_image)
     except RuntimeError as exc:
         logger.error("embed_person_inference_error", error=str(exc))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error durante la detección o inferencia",
+            detail="Error durante la inferencia",
         ) from exc
 
     logger.info(
         "embed_person_ok",
-        count=len(detected),
+        dimension=len(embedding),
         processing_ms=elapsed_ms,
         filename=image.filename,
     )
 
-    return MultiEmbeddingResponse(
+    return EmbeddingResponse(
         model=settings.model_name_person,
-        count=len(detected),
-        detections=[_to_detection_schema(d) for d in detected],
+        dimension=len(embedding),
+        embedding=embedding,
         processing_ms=elapsed_ms,
     )
 
 
 @router.post(
     "/embed/vehicle",
-    response_model=MultiEmbeddingResponse,
+    response_model=EmbeddingResponse,
     status_code=status.HTTP_200_OK,
-    summary="Detectar vehículos y generar embeddings",
+    summary="Generar embedding de vehículo",
     description=(
-        "Recibe una imagen completa (multipart/form-data), detecta todos los vehículos, "
-        "realiza un crop temporal de cada uno y retorna su embedding visual. "
+        "Recibe un crop de vehículo (multipart/form-data) y retorna su embedding visual. "
         "Requiere header `x-api-key`."
     ),
     tags=["Embeddings"],
@@ -106,9 +104,9 @@ async def embed_person(
 @limiter.limit(settings.rate_limit_embed)
 async def embed_vehicle(
     request: Request,
-    image: UploadFile = File(..., description="Imagen completa a analizar (JPEG/PNG/WebP, máx 5MB)"),
+    image: UploadFile = File(..., description="Imagen recortada del vehículo (JPEG/PNG/WebP, máx 5MB)"),
     service: FastReIDService = Depends(get_fastreid_service),
-) -> MultiEmbeddingResponse:
+) -> EmbeddingResponse:
     if not service.vehicle_model_loaded:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -126,22 +124,22 @@ async def embed_vehicle(
         ) from exc
 
     try:
-        detected, elapsed_ms = service.embed_vehicles_from_image(pil_image)
+        embedding, elapsed_ms = service.embed_vehicle(pil_image)
     except RuntimeError as exc:
         logger.error("embed_vehicle_inference_error", error=str(exc))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error durante la detección o inferencia",
+            detail="Error durante la inferencia",
         ) from exc
 
     logger.info(
         "embed_vehicle_ok",
-        count=len(detected),
+        dimension=len(embedding),
         processing_ms=elapsed_ms,
         filename=image.filename,
     )
 
-    return MultiEmbeddingResponse(
+    return EmbeddingResponse(
         model=settings.model_name_vehicle,
         dimension=len(embedding),
         embedding=embedding,

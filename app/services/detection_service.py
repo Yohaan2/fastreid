@@ -58,6 +58,13 @@ class DetectionService:
                     self._load_model()
         return self._model
 
+    @property
+    def model_loaded(self) -> bool:
+        """Indica si el modelo de detección está cargado en memoria o si los pesos existen en el disco."""
+        if self._model is not None:
+            return True
+        return os.path.exists(settings.detection_model_path)
+
     def _load_model(self) -> None:
         """Carga el detector YOLO de forma estrictamente local y manual."""
         if "YOLO_CONFIG_DIR" not in os.environ:
