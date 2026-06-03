@@ -1,15 +1,10 @@
 """
-Singleton de detección de objetos (YOLO / Ultralytics).
+Singleton de detección de objetos (YOLO / Ultralytics) con Lazy Loading.
 
 Responsabilidades:
-- Cargar el detector YOLO UNA SOLA VEZ al inicio del servicio.
-- Analizar una imagen completa y devolver bounding boxes de personas
-  o vehículos (equivalente a la detección de rostros de InsightFace,
-  pero para cuerpo completo y vehículos).
+- Cargar el detector YOLO bajo demanda (solo si se usa el endpoint de imagen completa).
+- Analizar una imagen completa y devolver bounding boxes de personas.
 - NO genera embeddings: solo localiza objetos y los devuelve como cajas.
-
-El recorte (crop) y el embedding los realiza FastReIDService a partir de
-las cajas que entrega este servicio.
 """
 import os
 import threading
@@ -39,17 +34,12 @@ class Detection:
 
 
 class DetectionService:
-    """Wrapper singleton sobre el detector YOLO de Ultralytics."""
+    """Wrapper singleton sobre el detector YOLO de Ultralytics con carga perezosa."""
 
     _instance: Optional["DetectionService"] = None
 
     def __init__(self) -> None:
         self._model = None
-        self._load_model()
-
-    # ------------------------------------------------------------------
-    # Singleton thread-safe
-    # ------------------------------------------------------------------
 
     @classmethod
     def get_instance(cls) -> "DetectionService":
@@ -59,16 +49,17 @@ class DetectionService:
                     cls._instance = cls()
         return cls._instance
 
-    # ------------------------------------------------------------------
-    # Carga del modelo
-    # ------------------------------------------------------------------
+    @property
+    def model(self):
+        """Carga perezosa del modelo YOLO la primera vez que se solicita."""
+        if self._model is None:
+            with _lock:
+                if self._model is None:
+                    self._load_model()
+        return self._model
 
     def _load_model(self) -> None:
-        """
-        Carga el detector YOLO de forma estrictamente local y manual.
-        No realiza ninguna descarga automática por red.
-        """
-        # Configurar variable de entorno para evitar warnings de permisos de escritura en Docker/Linux
+        """Carga el detector YOLO de forma estrictamente local y manual."""
         if "YOLO_CONFIG_DIR" not in os.environ:
             os.environ["YOLO_CONFIG_DIR"] = "/tmp"
 
@@ -89,8 +80,10 @@ class DetectionService:
         try:
             from ultralytics import YOLO
 
-            self._model = YOLO(weights)
-            self._model.to("cuda" if settings.enable_gpu else "cpu")
+            logger.info("lazy_loading_yolo_started", weights=weights)
+            model = YOLO(weights)
+            model.to("cuda" if settings.enable_gpu else "cpu")
+            self._model = model
             logger.info("detection_model_loaded", weights=weights)
 
         except ImportError:
@@ -100,16 +93,8 @@ class DetectionService:
             )
             self._model = None
         except Exception as exc:
-            logger.error(
-                "detection_model_load_error",
-                error=str(exc),
-                hint=f"Error al inicializar YOLO con los pesos en: {os.path.abspath(weights)}"
-            )
+            logger.error("yolo_load_error", error=str(exc))
             self._model = None
-
-    @property
-    def model_loaded(self) -> bool:
-        return self._model is not None
 
     # ------------------------------------------------------------------
     # Detección pública
@@ -118,10 +103,6 @@ class DetectionService:
     def detect_persons(self, image: Image.Image) -> list[Detection]:
         """Detecta personas (cuerpo completo) en la imagen."""
         return self._detect(image, allowed_classes={settings.detection_person_class})
-
-    def detect_vehicles(self, image: Image.Image) -> list[Detection]:
-        """Detecta vehículos (car, motorcycle, bus, truck) en la imagen."""
-        return self._detect(image, allowed_classes=settings.vehicle_class_ids)
 
     # ------------------------------------------------------------------
     # Lógica interna
@@ -132,17 +113,18 @@ class DetectionService:
         image: Image.Image,
         allowed_classes: set[int],
     ) -> list[Detection]:
-        if self._model is None:
-            raise RuntimeError("Detector YOLO no disponible — modelo no cargado")
+        yolo_model = self.model
+        if yolo_model is None:
+            raise RuntimeError("Detector YOLO no disponible — modelo no cargado o pesos faltantes")
 
         rgb = image.convert("RGB") if image.mode != "RGB" else image
 
-        results = self._model.predict(
+        results = yolo_model.predict(
             source=rgb,
             conf=settings.detection_confidence,
             iou=settings.detection_iou,
             classes=list(allowed_classes),
-            imgsz=320,  # Reducir resolución para velocidad (default 640)
+            imgsz=320,  # Reducir resolución para velocidad óptima en CPU
             verbose=False,
         )
 
@@ -159,11 +141,13 @@ class DetectionService:
                     continue
                 conf = float(box.conf[0])
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
+                
                 # Clamp a los límites de la imagen
                 ix1 = max(0, int(x1))
                 iy1 = max(0, int(y1))
                 ix2 = min(width, int(x2))
                 iy2 = min(height, int(y2))
+                
                 if ix2 <= ix1 or iy2 <= iy1:
                     continue
                 detections.append(

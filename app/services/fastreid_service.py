@@ -195,7 +195,7 @@ class FastReIDService:
         return torch.cuda.is_available()
 
     # ------------------------------------------------------------------
-    # Inferencia pública
+    # Inferencia pública (crops directos - tradicional)
     # ------------------------------------------------------------------
 
     def embed_person(self, image: Image.Image) -> tuple[list[float], int]:
@@ -217,13 +217,13 @@ class FastReIDService:
         )
 
     # ------------------------------------------------------------------
-    # Detección + crop temporal + embedding (imagen completa)
+    # Detección + crop temporal + embedding (imagen completa - nuevo endpoint)
     # ------------------------------------------------------------------
 
     def embed_persons_from_image(self, image: Image.Image) -> tuple[list[DetectedEmbedding], int]:
         """
         Analiza una imagen completa, detecta personas, recorta cada una
-        (crop temporal) y genera su embedding.
+        (crop temporal) y genera su embedding en un único batch optimizado.
         """
         t_total = time.perf_counter()
         detector = DetectionService.get_instance()
@@ -253,39 +253,6 @@ class FastReIDService:
         )
         return results, total_ms
 
-    def embed_vehicles_from_image(self, image: Image.Image) -> tuple[list[DetectedEmbedding], int]:
-        """
-        Analiza una imagen completa, detecta vehículos, recorta cada uno
-        (crop temporal) and genera su embedding.
-        """
-        t_total = time.perf_counter()
-        detector = DetectionService.get_instance()
-
-        # Etapa 1: Detección
-        t_det = time.perf_counter()
-        detections = detector.detect_vehicles(image)
-        det_ms = int((time.perf_counter() - t_det) * 1000)
-        logger.info("detection_stage", label="vehicle", count=len(detections), detection_ms=det_ms)
-
-        # Etapa 2: Crop + Embedding
-        results, embed_ms = self._detect_crop_embed(
-            image=image,
-            detections=detections,
-            model=self.vehicle_model,
-            transform=VEHICLE_TRANSFORM,
-            label="vehicle",
-        )
-
-        total_ms = int((time.perf_counter() - t_total) * 1000)
-        logger.info(
-            "pipeline_total",
-            label="vehicle",
-            detection_ms=det_ms,
-            embedding_ms=embed_ms,
-            total_ms=total_ms,
-        )
-        return results, total_ms
-
     def _detect_crop_embed(
         self,
         image: Image.Image,
@@ -303,24 +270,23 @@ class FastReIDService:
         if not detections:
             return [], 0
 
-        # Batch processing: recortar, preprocesar y apilar todos los crops
+        # Batch processing: recortar todos los crops
         t_crop = time.perf_counter()
         crops = [rgb.crop((det.x1, det.y1, det.x2, det.y2)) for det in detections]
         crop_ms = int((time.perf_counter() - t_crop) * 1000)
 
-        # Preprocesar batch completo
-        t_preprocess = time.perf_counter()
+        # Preprocesar batch completo en un tensor
         tensors = []
         for crop in crops:
             if crop.mode != "RGB":
                 crop = crop.convert("RGB")
             tensors.append(transform(crop))
         
-        # Apilar en batch (N, C, H, W)
+        # Apilar en batch (N, C, H, W) y mover al device
         batch_tensor = torch.stack(tensors).to(self._device)
         preprocess_ms = int((time.perf_counter() - t_crop) * 1000)
 
-        # Inferencia batch única
+        # Inferencia batch única ultrarrápida
         t_inference = time.perf_counter()
         with torch.inference_mode():
             output = model(batch_tensor)
@@ -356,7 +322,7 @@ class FastReIDService:
         return results, elapsed_ms
 
     # ------------------------------------------------------------------
-    # Lógica de inferencia interna
+    # Lógica de inferencia interna (individual)
     # ------------------------------------------------------------------
 
     def _run_inference(
