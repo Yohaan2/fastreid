@@ -60,7 +60,6 @@ class FastReIDService:
             
         self._person_model: Optional[torch.nn.Module] = None
         self._vehicle_model: Optional[torch.nn.Module] = None
-        self._load_models()
 
     # ------------------------------------------------------------------
     # Singleton thread-safe
@@ -95,20 +94,34 @@ class FastReIDService:
         return self._device
 
     # ------------------------------------------------------------------
-    # Carga de modelos
+    # Lazy Loading de modelos
     # ------------------------------------------------------------------
 
-    def _load_models(self) -> None:
-        self._person_model = self._load_single_model(
-            config_path=settings.fastreid_config_person,
-            weights_path=settings.model_path_person,
-            label="person",
-        )
-        self._vehicle_model = self._load_single_model(
-            config_path=settings.fastreid_config_vehicle,
-            weights_path=settings.model_path_vehicle,
-            label="vehicle",
-        )
+    @property
+    def person_model(self) -> Optional[torch.nn.Module]:
+        if self._person_model is None:
+            with _lock:
+                if self._person_model is None:
+                    logger.info("lazy_loading_model_started", label="person")
+                    self._person_model = self._load_single_model(
+                        config_path=settings.fastreid_config_person,
+                        weights_path=settings.model_path_person,
+                        label="person",
+                    )
+        return self._person_model
+
+    @property
+    def vehicle_model(self) -> Optional[torch.nn.Module]:
+        if self._vehicle_model is None:
+            with _lock:
+                if self._vehicle_model is None:
+                    logger.info("lazy_loading_model_started", label="vehicle")
+                    self._vehicle_model = self._load_single_model(
+                        config_path=settings.fastreid_config_vehicle,
+                        weights_path=settings.model_path_vehicle,
+                        label="vehicle",
+                    )
+        return self._vehicle_model
 
     def _load_single_model(
         self,
@@ -167,11 +180,15 @@ class FastReIDService:
 
     @property
     def person_model_loaded(self) -> bool:
-        return self._person_model is not None
+        if self._person_model is not None:
+            return True
+        return os.path.exists(settings.model_path_person)
 
     @property
     def vehicle_model_loaded(self) -> bool:
-        return self._vehicle_model is not None
+        if self._vehicle_model is not None:
+            return True
+        return os.path.exists(settings.model_path_vehicle)
 
     @property
     def gpu_available(self) -> bool:
@@ -185,7 +202,7 @@ class FastReIDService:
         """Genera embedding para un crop de persona."""
         return self._run_inference(
             image=image,
-            model=self._person_model,
+            model=self.person_model,
             transform=PERSON_TRANSFORM,
             label="person",
         )
@@ -194,7 +211,7 @@ class FastReIDService:
         """Genera embedding para un crop de vehículo."""
         return self._run_inference(
             image=image,
-            model=self._vehicle_model,
+            model=self.vehicle_model,
             transform=VEHICLE_TRANSFORM,
             label="vehicle",
         )
@@ -221,7 +238,7 @@ class FastReIDService:
         results, embed_ms = self._detect_crop_embed(
             image=image,
             detections=detections,
-            model=self._person_model,
+            model=self.person_model,
             transform=PERSON_TRANSFORM,
             label="person",
         )
@@ -239,7 +256,7 @@ class FastReIDService:
     def embed_vehicles_from_image(self, image: Image.Image) -> tuple[list[DetectedEmbedding], int]:
         """
         Analiza una imagen completa, detecta vehículos, recorta cada uno
-        (crop temporal) y genera su embedding.
+        (crop temporal) and genera su embedding.
         """
         t_total = time.perf_counter()
         detector = DetectionService.get_instance()
@@ -254,7 +271,7 @@ class FastReIDService:
         results, embed_ms = self._detect_crop_embed(
             image=image,
             detections=detections,
-            model=self._vehicle_model,
+            model=self.vehicle_model,
             transform=VEHICLE_TRANSFORM,
             label="vehicle",
         )
