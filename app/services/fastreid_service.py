@@ -12,6 +12,7 @@ NO conoce: cámaras, eventos, usuarios, zonas, base de datos.
 import os
 import time
 import threading
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -20,6 +21,7 @@ from PIL import Image
 
 from app.core.config import settings
 from app.core.logger import get_logger
+from app.services.detection_service import Detection, DetectionService
 from app.services.preprocessing import (
     PERSON_TRANSFORM,
     VEHICLE_TRANSFORM,
@@ -31,6 +33,15 @@ logger = get_logger(__name__)
 _lock = threading.Lock()
 
 
+@dataclass
+class DetectedEmbedding:
+    """Resultado de detectar + recortar + embeber un único objeto."""
+
+    bbox: tuple[int, int, int, int]  # (x1, y1, x2, y2)
+    confidence: float
+    embedding: list[float]
+
+
 class FastReIDService:
     """Wrapper singleton sobre los modelos FastReID de persona y vehículo."""
 
@@ -38,9 +49,15 @@ class FastReIDService:
 
     def __init__(self) -> None:
         self._device = self._resolve_device()
+        
+        # Limitar hilos de PyTorch en CPU para evitar thread thrashing en VPS/Droplets
+        if self._device.type == "cpu":
+            torch.set_num_threads(1)
+            torch.set_num_interop_threads(1)
+            logger.info("pytorch_threads_optimized", num_threads=1, num_interop_threads=1)
+            
         self._person_model: Optional[torch.nn.Module] = None
         self._vehicle_model: Optional[torch.nn.Module] = None
-        self._load_models()
 
     # ------------------------------------------------------------------
     # Singleton thread-safe
@@ -75,20 +92,34 @@ class FastReIDService:
         return self._device
 
     # ------------------------------------------------------------------
-    # Carga de modelos
+    # Lazy Loading de modelos
     # ------------------------------------------------------------------
 
-    def _load_models(self) -> None:
-        self._person_model = self._load_single_model(
-            config_path=settings.fastreid_config_person,
-            weights_path=settings.model_path_person,
-            label="person",
-        )
-        self._vehicle_model = self._load_single_model(
-            config_path=settings.fastreid_config_vehicle,
-            weights_path=settings.model_path_vehicle,
-            label="vehicle",
-        )
+    @property
+    def person_model(self) -> Optional[torch.nn.Module]:
+        if self._person_model is None:
+            with _lock:
+                if self._person_model is None:
+                    logger.info("lazy_loading_model_started", label="person")
+                    self._person_model = self._load_single_model(
+                        config_path=settings.fastreid_config_person,
+                        weights_path=settings.model_path_person,
+                        label="person",
+                    )
+        return self._person_model
+
+    @property
+    def vehicle_model(self) -> Optional[torch.nn.Module]:
+        if self._vehicle_model is None:
+            with _lock:
+                if self._vehicle_model is None:
+                    logger.info("lazy_loading_model_started", label="vehicle")
+                    self._vehicle_model = self._load_single_model(
+                        config_path=settings.fastreid_config_vehicle,
+                        weights_path=settings.model_path_vehicle,
+                        label="vehicle",
+                    )
+        return self._vehicle_model
 
     def _load_single_model(
         self,
@@ -147,25 +178,29 @@ class FastReIDService:
 
     @property
     def person_model_loaded(self) -> bool:
-        return self._person_model is not None
+        if self._person_model is not None:
+            return True
+        return os.path.exists(settings.model_path_person)
 
     @property
     def vehicle_model_loaded(self) -> bool:
-        return self._vehicle_model is not None
+        if self._vehicle_model is not None:
+            return True
+        return os.path.exists(settings.model_path_vehicle)
 
     @property
     def gpu_available(self) -> bool:
         return torch.cuda.is_available()
 
     # ------------------------------------------------------------------
-    # Inferencia pública
+    # Inferencia pública (crops directos - tradicional)
     # ------------------------------------------------------------------
 
     def embed_person(self, image: Image.Image) -> tuple[list[float], int]:
         """Genera embedding para un crop de persona."""
         return self._run_inference(
             image=image,
-            model=self._person_model,
+            model=self.person_model,
             transform=PERSON_TRANSFORM,
             label="person",
         )
@@ -174,13 +209,118 @@ class FastReIDService:
         """Genera embedding para un crop de vehículo."""
         return self._run_inference(
             image=image,
-            model=self._vehicle_model,
+            model=self.vehicle_model,
             transform=VEHICLE_TRANSFORM,
             label="vehicle",
         )
 
     # ------------------------------------------------------------------
-    # Lógica de inferencia interna
+    # Detección + crop temporal + embedding (imagen completa - nuevo endpoint)
+    # ------------------------------------------------------------------
+
+    def embed_persons_from_image(self, image: Image.Image) -> tuple[list[DetectedEmbedding], int]:
+        """
+        Analiza una imagen completa, detecta personas, recorta cada una
+        (crop temporal) y genera su embedding en un único batch optimizado.
+        """
+        t_total = time.perf_counter()
+        detector = DetectionService.get_instance()
+
+        # Etapa 1: Detección
+        t_det = time.perf_counter()
+        detections = detector.detect_persons(image)
+        det_ms = int((time.perf_counter() - t_det) * 1000)
+        logger.info("detection_stage", label="person", count=len(detections), detection_ms=det_ms)
+
+        # Etapa 2: Crop + Embedding
+        results, embed_ms = self._detect_crop_embed(
+            image=image,
+            detections=detections,
+            model=self.person_model,
+            transform=PERSON_TRANSFORM,
+            label="person",
+        )
+
+        total_ms = int((time.perf_counter() - t_total) * 1000)
+        logger.info(
+            "pipeline_total",
+            label="person",
+            detection_ms=det_ms,
+            embedding_ms=embed_ms,
+            total_ms=total_ms,
+        )
+        return results, total_ms
+
+    def _detect_crop_embed(
+        self,
+        image: Image.Image,
+        detections: list[Detection],
+        model: Optional[torch.nn.Module],
+        transform,
+        label: str,
+    ) -> tuple[list[DetectedEmbedding], int]:
+        if model is None:
+            raise RuntimeError(f"Modelo {label} no disponible — pesos no cargados")
+
+        t_start = time.perf_counter()
+        rgb = image.convert("RGB") if image.mode != "RGB" else image
+
+        if not detections:
+            return [], 0
+
+        # Batch processing: recortar todos los crops
+        t_crop = time.perf_counter()
+        crops = [rgb.crop((det.x1, det.y1, det.x2, det.y2)) for det in detections]
+        crop_ms = int((time.perf_counter() - t_crop) * 1000)
+
+        # Preprocesar batch completo en un tensor
+        tensors = []
+        for crop in crops:
+            if crop.mode != "RGB":
+                crop = crop.convert("RGB")
+            tensors.append(transform(crop))
+        
+        # Apilar en batch (N, C, H, W) y mover al device
+        batch_tensor = torch.stack(tensors).to(self._device)
+        preprocess_ms = int((time.perf_counter() - t_crop) * 1000)
+
+        # Inferencia batch única ultrarrápida
+        t_inference = time.perf_counter()
+        with torch.inference_mode():
+            output = model(batch_tensor)
+        
+        features: torch.Tensor = output["features"] if isinstance(output, dict) else output
+        features = F.normalize(features, p=2, dim=1)
+        inference_ms = int((time.perf_counter() - t_inference) * 1000)
+
+        # Convertir a lista de embeddings
+        embeddings_list = features.cpu().tolist()
+
+        # Construir resultados
+        results: list[DetectedEmbedding] = []
+        for det, embedding in zip(detections, embeddings_list):
+            results.append(
+                DetectedEmbedding(
+                    bbox=(det.x1, det.y1, det.x2, det.y2),
+                    confidence=det.confidence,
+                    embedding=embedding,
+                )
+            )
+
+        elapsed_ms = int((time.perf_counter() - t_start) * 1000)
+        logger.info(
+            "detect_crop_embed_ok",
+            label=label,
+            count=len(results),
+            crop_ms=crop_ms,
+            preprocess_ms=preprocess_ms,
+            inference_ms=inference_ms,
+            total_ms=elapsed_ms,
+        )
+        return results, elapsed_ms
+
+    # ------------------------------------------------------------------
+    # Lógica de inferencia interna (individual)
     # ------------------------------------------------------------------
 
     def _run_inference(
@@ -197,7 +337,7 @@ class FastReIDService:
 
         tensor = preprocess_image(image, transform, self._device)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             output = model(tensor)
 
         # FastReID puede retornar dict o tensor directo según la config
