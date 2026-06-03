@@ -51,6 +51,13 @@ class FastReIDService:
 
     def __init__(self) -> None:
         self._device = self._resolve_device()
+        
+        # Limitar hilos de PyTorch en CPU para evitar thread thrashing en VPS/Droplets
+        if self._device.type == "cpu":
+            torch.set_num_threads(1)
+            torch.set_num_interop_threads(1)
+            logger.info("pytorch_threads_optimized", num_threads=1, num_interop_threads=1)
+            
         self._person_model: Optional[torch.nn.Module] = None
         self._vehicle_model: Optional[torch.nn.Module] = None
         self._load_models()
@@ -298,7 +305,7 @@ class FastReIDService:
 
         # Inferencia batch única
         t_inference = time.perf_counter()
-        with torch.no_grad():
+        with torch.inference_mode():
             output = model(batch_tensor)
         
         features: torch.Tensor = output["features"] if isinstance(output, dict) else output
@@ -349,7 +356,7 @@ class FastReIDService:
 
         tensor = preprocess_image(image, transform, self._device)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             output = model(tensor)
 
         # FastReID puede retornar dict o tensor directo según la config
