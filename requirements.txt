@@ -23,5 +23,11 @@ Pillow==10.3.0
 opencv-python-headless==4.9.0.80
 numpy==1.26.4
 
+# Observabilidad
+opentelemetry-api==1.25.0
+opentelemetry-sdk==1.25.0
+opentelemetry-exporter-otlp-proto-grpc==1.25.0
+opentelemetry-instrumentation-fastapi==0.46b0
+
 # FastReID se instala desde fuente en el Dockerfile:
 # git clone https://github.com/JDAI-CV/fast-reid.git && pip install -e .

@@ -10,11 +10,13 @@ from slowapi.util import get_remote_address
 from app.api.routes import embed, health
 from app.core.config import settings
 from app.core.logger import get_logger, setup_logging
+from app.core.tracing import configure_tracing, shutdown_tracing
 from app.services.detection_service import DetectionService
 from app.services.fastreid_service import FastReIDService
 
 setup_logging(settings.log_level)
 logger = get_logger(__name__)
+tracer_provider = None
 
 
 @asynccontextmanager
@@ -24,6 +26,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     - Startup: carga modelos UNA SOLA VEZ en el singleton FastReIDService.
     - Shutdown: libera recursos GPU si aplica.
     """
+    global tracer_provider
+
+    tracer_provider = configure_tracing(app)
     logger.info("service_startup", env=settings.app_env)
     FastReIDService.get_instance()
     DetectionService.get_instance()
@@ -34,8 +39,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         detector=DetectionService.get_instance().model_loaded,
         device=str(FastReIDService.get_instance().device),
     )
-    yield
-    logger.info("service_shutdown")
+
+    try:
+        yield
+    finally:
+        logger.info("service_shutdown")
+        if tracer_provider is not None:
+            shutdown_tracing(tracer_provider)
 
 
 limiter = Limiter(key_func=get_remote_address)
