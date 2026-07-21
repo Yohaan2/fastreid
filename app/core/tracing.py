@@ -42,6 +42,6 @@ def configure_tracing(app: FastAPI) -> TracerProvider:
     return provider
 
 
-def shutdown_tracing(provider: TracerProvider) -> None:
-    FastAPIInstrumentor.uninstrument()
+def shutdown_tracing(app: FastAPI, provider: TracerProvider) -> None:
+    FastAPIInstrumentor.uninstrument_app(app)
     provider.shutdown()

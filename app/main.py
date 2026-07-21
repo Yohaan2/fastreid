@@ -16,7 +16,6 @@ from app.services.fastreid_service import FastReIDService
 
 setup_logging(settings.log_level)
 logger = get_logger(__name__)
-tracer_provider = None
 
 
 @asynccontextmanager
@@ -26,9 +25,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     - Startup: carga modelos UNA SOLA VEZ en el singleton FastReIDService.
     - Shutdown: libera recursos GPU si aplica.
     """
-    global tracer_provider
-
-    tracer_provider = configure_tracing(app)
     logger.info("service_startup", env=settings.app_env)
     FastReIDService.get_instance()
     DetectionService.get_instance()
@@ -44,8 +40,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         yield
     finally:
         logger.info("service_shutdown")
-        if tracer_provider is not None:
-            shutdown_tracing(tracer_provider)
+        shutdown_tracing(app, tracer_provider)
 
 
 limiter = Limiter(key_func=get_remote_address)
@@ -62,6 +57,8 @@ app = FastAPI(
     openapi_url="/openapi.json" if settings.app_env == "development" else None,
     lifespan=lifespan,
 )
+
+tracer_provider = configure_tracing(app)
 
 # Rate limiting global
 app.state.limiter = limiter
