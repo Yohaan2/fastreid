@@ -188,12 +188,13 @@ class FastReIDService:
             )
             wrapper = _FastReIDOnnxExportWrapper(pt_model).eval().to("cpu")
             dummy_input = torch.randn(1, 3, height, width, dtype=torch.float32, device="cpu")
+            tmp_target = f"{target_path}.tmp.{os.getpid()}"
 
             with torch.no_grad():
                 torch.onnx.export(
                     wrapper,
                     dummy_input,
-                    target_path,
+                    tmp_target,
                     export_params=True,
                     opset_version=17,
                     do_constant_folding=True,
@@ -205,9 +206,16 @@ class FastReIDService:
                     },
                 )
 
+            os.replace(tmp_target, target_path)
             logger.info("onnx_auto_export_completed", label=label, onnx_path=target_path)
             return target_path
         except Exception as exc:
+            try:
+                tmp_target = f"{target_path}.tmp.{os.getpid()}"
+                if os.path.exists(tmp_target):
+                    os.remove(tmp_target)
+            except OSError:
+                pass
             logger.warning(
                 "onnx_auto_export_failed_using_pytorch",
                 label=label,
@@ -369,7 +377,32 @@ class FastReIDService:
             cfg.freeze()
 
             model = build_model(cfg)
-            Checkpointer(model).load(weights_path)
+
+            # Compatibilidad entre checkpoints FastReID v0.1 (`heads.bnneck.*`)
+            # y FastReID master (`heads.bottleneck.0.*`)
+            ckpt = torch.load(weights_path, map_location=self._device, weights_only=False)
+            state_dict = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
+            model_keys = set(model.state_dict().keys())
+
+            if isinstance(state_dict, dict):
+                remapped = False
+                for old_suffix in ("weight", "bias", "running_mean", "running_var", "num_batches_tracked"):
+                    old_key = f"heads.bnneck.{old_suffix}"
+                    new_key = f"heads.bottleneck.0.{old_suffix}"
+                    if old_key in state_dict and new_key in model_keys and new_key not in state_dict:
+                        state_dict[new_key] = state_dict.pop(old_key)
+                        remapped = True
+                if remapped:
+                    logger.info("checkpoint_bnneck_remapped", label=label)
+                incompatible = model.load_state_dict(state_dict, strict=False)
+                missing = [
+                    k for k in incompatible.missing_keys if not k.endswith("heads.weight")
+                ]
+                if missing:
+                    logger.warning("checkpoint_missing_keys", label=label, missing=missing)
+            else:
+                Checkpointer(model).load(weights_path)
+
             model.eval()
             model.to(self._device)
 
