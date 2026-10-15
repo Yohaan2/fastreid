@@ -1,5 +1,5 @@
 from pydantic import BaseModel, ConfigDict, Field
-from typing import Annotated, Optional
+from typing import Annotated, Literal
 
 
 class HealthResponse(BaseModel):
@@ -13,45 +13,19 @@ class HealthResponse(BaseModel):
 
 
 class EmbeddingResponse(BaseModel):
-    model: str = Field(examples=["fastreid_person"])
+    object_type: Literal["person", "vehicle"] = Field(
+        default="person",
+        description="Tipo de objeto embebido (person | vehicle)",
+    )
+    model: str = Field(examples=["msmt17_sbs_R101-ibn"])
     dimension: int = Field(examples=[2048])
     embedding: Annotated[list[float], Field(min_length=1)]
     processing_ms: int = Field(examples=[38], description="Tiempo de inferencia en milisegundos")
 
 
 class BoundingBox(BaseModel):
-    """Caja delimitadora absoluta del objeto detectado (píxeles)."""
+    """Bounding box en formato x, y, width, height (píxeles absolutos)."""
 
-    x: float = Field(description="Coordenada X de la esquina superior izquierda")
-    y: float = Field(description="Coordenada Y de la esquina superior izquierda")
-    width: float
-    height: float
-
-
-class DetectionEmbedding(BaseModel):
-    """Embedding de un único objeto detectado y recortado de la imagen."""
-
-    bbox: BoundingBox
-    confidence: float = Field(examples=[0.92], description="Confianza de la detección")
-    dimension: int = Field(examples=[2048])
-    embedding: Annotated[list[float], Field(min_length=1)]
-
-
-class MultiEmbeddingResponse(BaseModel):
-    """Respuesta para una imagen completa: N objetos detectados + embeddings."""
-
-    model: str = Field(examples=["fastreid_person"])
-    count: int = Field(examples=[2], description="Número de objetos detectados")
-    detections: list[DetectionEmbedding]
-    processing_ms: int = Field(examples=[120], description="Tiempo total (detección + embedding) en ms")
-
-
-class ErrorResponse(BaseModel):
-    detail: str
-
-
-class BoundingBox(BaseModel):
-    """Bounding box en formato x, y, width, height (relativo o absoluto)."""
     x: float = Field(..., description="Coordenada x inicial (esquina superior izquierda)")
     y: float = Field(..., description="Coordenada y inicial (esquina superior izquierda)")
     width: float = Field(..., description="Ancho del bounding box")
@@ -59,7 +33,16 @@ class BoundingBox(BaseModel):
 
 
 class DetectionEmbedding(BaseModel):
-    """Par de bounding box, confianza del detector y embedding visual correspondiente."""
+    """Par de bounding box, tipo de objeto, confianza del detector y embedding visual."""
+
+    object_type: Literal["person", "vehicle"] = Field(
+        default="person",
+        description="Tipo de objeto detectado y embebido (person | vehicle)",
+    )
+    model: str = Field(
+        default="msmt17_sbs_R101-ibn",
+        description="Modelo ReID utilizado para generar este embedding",
+    )
     bbox: BoundingBox
     confidence: float = Field(..., description="Confianza de la detección entre 0 y 1")
     dimension: int = Field(examples=[2048], description="Dimensión del embedding visual")
@@ -67,8 +50,14 @@ class DetectionEmbedding(BaseModel):
 
 
 class MultiEmbeddingResponse(BaseModel):
-    """Respuesta para endpoints que procesan imágenes completas con múltiples objetos."""
-    model: str = Field(examples=["fastreid_person"])
+    """Respuesta para endpoints que procesan imágenes completas o consultas con múltiples objetos."""
+
+    model: str = Field(examples=["msmt17_sbs_R101-ibn+sbs_R50-ibn_vehicle"])
     count: int = Field(..., description="Cantidad de objetos detectados y procesados")
     detections: list[DetectionEmbedding] = Field(default_factory=list)
     processing_ms: int = Field(..., description="Tiempo total de procesamiento en milisegundos")
+
+
+class ErrorResponse(BaseModel):
+    detail: str
+

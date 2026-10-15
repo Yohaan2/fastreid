@@ -26,14 +26,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     - Shutdown: libera recursos GPU si aplica.
     """
     logger.info("service_startup", env=settings.app_env)
-    FastReIDService.get_instance()
+    reid_service = FastReIDService.get_instance()
+    reid_service.warmup()
     DetectionService.get_instance()
     logger.info(
         "service_ready",
-        person_model=FastReIDService.get_instance().person_model_loaded,
-        vehicle_model=FastReIDService.get_instance().vehicle_model_loaded,
+        person_model=reid_service.person_model_loaded,
+        vehicle_model=reid_service.vehicle_model_loaded,
         detector=DetectionService.get_instance().model_loaded,
-        device=str(FastReIDService.get_instance().device),
+        device=str(reid_service.device),
     )
 
     try:

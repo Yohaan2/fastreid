@@ -23,7 +23,12 @@ logger = get_logger(__name__)
 def _to_detection_schema(item: DetectedEmbedding) -> DetectionEmbedding:
     """Convierte el resultado interno del servicio al schema de respuesta."""
     x1, y1, x2, y2 = item.bbox
+    default_model = (
+        settings.model_name_vehicle if item.object_type == "vehicle" else settings.model_name_person
+    )
     return DetectionEmbedding(
+        object_type=item.object_type,
+        model=item.model or default_model,
         bbox=BoundingBox(x=float(x1), y=float(y1), width=float(x2 - x1), height=float(y2 - y1)),
         confidence=item.confidence,
         dimension=len(item.embedding),
@@ -66,7 +71,7 @@ async def embed_person(
         ) from exc
 
     try:
-        embedding, elapsed_ms = service.embed_person(pil_image)
+        embedding, elapsed_ms = await service.embed_person_batched(pil_image)
     except RuntimeError as exc:
         logger.error("embed_person_inference_error", error=str(exc))
         raise HTTPException(
@@ -82,6 +87,7 @@ async def embed_person(
     )
 
     return EmbeddingResponse(
+        object_type="person",
         model=settings.model_name_person,
         dimension=len(embedding),
         embedding=embedding,
@@ -124,7 +130,7 @@ async def embed_vehicle(
         ) from exc
 
     try:
-        embedding, elapsed_ms = service.embed_vehicle(pil_image)
+        embedding, elapsed_ms = await service.embed_vehicle_batched(pil_image)
     except RuntimeError as exc:
         logger.error("embed_vehicle_inference_error", error=str(exc))
         raise HTTPException(
@@ -140,6 +146,7 @@ async def embed_vehicle(
     )
 
     return EmbeddingResponse(
+        object_type="vehicle",
         model=settings.model_name_vehicle,
         dimension=len(embedding),
         embedding=embedding,
@@ -204,3 +211,122 @@ async def embed_person_full(
         detections=[_to_detection_schema(d) for d in detected],
         processing_ms=elapsed_ms,
     )
+
+
+@router.post(
+    "/embed/vehicle/full",
+    response_model=MultiEmbeddingResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Detectar vehículos y generar embeddings de imagen completa",
+    description=(
+        "Recibe una imagen completa (multipart/form-data), detecta todos los vehículos "
+        "(car, motorcycle, bus, truck), realiza un crop temporal de cada uno y retorna "
+        "su embedding visual en batch. Requiere header `x-api-key`."
+    ),
+    tags=["Embeddings"],
+    dependencies=[RequireAPIKey],
+)
+@limiter.limit(settings.rate_limit_embed)
+async def embed_vehicle_full(
+    request: Request,
+    image: UploadFile = File(..., description="Imagen completa a analizar (JPEG/PNG/WebP, máx 5MB)"),
+    service: FastReIDService = Depends(get_fastreid_service),
+) -> MultiEmbeddingResponse:
+    if not service.vehicle_model_loaded:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Modelo de vehículo no disponible. Verificar pesos en weights/",
+        )
+
+    raw = await validate_upload_image(image)
+
+    try:
+        pil_image = bytes_to_pil(raw)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+    try:
+        detected, elapsed_ms = service.embed_vehicles_from_image(pil_image)
+    except RuntimeError as exc:
+        logger.error("embed_vehicle_full_inference_error", error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error durante la detección o inferencia",
+        ) from exc
+
+    logger.info(
+        "embed_vehicle_full_ok",
+        count=len(detected),
+        processing_ms=elapsed_ms,
+        filename=image.filename,
+    )
+
+    return MultiEmbeddingResponse(
+        model=settings.model_name_vehicle,
+        count=len(detected),
+        detections=[_to_detection_schema(d) for d in detected],
+        processing_ms=elapsed_ms,
+    )
+
+
+@router.post(
+    "/embed/query",
+    response_model=MultiEmbeddingResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Detectar personas y vehículos (o crop con fallback) y generar embeddings para búsqueda",
+    description=(
+        "Endpoint unificado para búsqueda forense: analiza una escena completa o un crop con YOLO "
+        "(personas + vehículos), aplica fallback con padding de 20% si el usuario subió un recorte "
+        "muy cerrado al borde, y genera el embedding de cada detección con su modelo ReID respectivo."
+    ),
+    tags=["Embeddings"],
+    dependencies=[RequireAPIKey],
+)
+@limiter.limit(settings.rate_limit_embed)
+async def embed_query(
+    request: Request,
+    image: UploadFile = File(..., description="Imagen de consulta (escena completa o crop, máx 5MB)"),
+    service: FastReIDService = Depends(get_fastreid_service),
+) -> MultiEmbeddingResponse:
+    if not service.person_model_loaded and not service.vehicle_model_loaded:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Modelos de persona y vehículo no disponibles. Verificar pesos en weights/",
+        )
+
+    raw = await validate_upload_image(image)
+
+    try:
+        pil_image = bytes_to_pil(raw)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+    try:
+        detected, elapsed_ms = service.embed_query_from_image(pil_image)
+    except RuntimeError as exc:
+        logger.error("embed_query_inference_error", error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error durante la detección o inferencia de consulta",
+        ) from exc
+
+    logger.info(
+        "embed_query_ok",
+        count=len(detected),
+        processing_ms=elapsed_ms,
+        filename=image.filename,
+    )
+
+    return MultiEmbeddingResponse(
+        model=f"{settings.model_name_person}+{settings.model_name_vehicle}",
+        count=len(detected),
+        detections=[_to_detection_schema(d) for d in detected],
+        processing_ms=elapsed_ms,
+    )
+

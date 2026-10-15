@@ -11,7 +11,7 @@ services:
     env_file:
       - .env
     volumes:
-      - ./weights:/app/weights:ro
+      - ./weights:/app/weights
       - ./logs:/app/logs
     expose:
       - "8000"

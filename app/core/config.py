@@ -21,11 +21,22 @@ class Settings(BaseSettings):
     # Model paths
     model_path_person: str = Field(default="weights/person_model.pth")
     model_path_vehicle: str = Field(default="weights/vehicle_model.pth")
-    fastreid_config_person: str = Field(default="configs/bagtricks_R50_person.yml")
-    fastreid_config_vehicle: str = Field(default="configs/bagtricks_R50_vehicle.yml")
-    model_name_person: str = Field(default="fastreid_person")
-    model_name_vehicle: str = Field(default="fastreid_vehicle")
+    model_onnx_path_person: str = Field(default="weights/person_model.onnx")
+    model_onnx_path_vehicle: str = Field(default="weights/vehicle_model.onnx")
+    enable_onnx: bool = Field(
+        default=True,
+        description="Usar ONNX Runtime en CPU automáticamente si existe o se exporta el archivo .onnx",
+    )
+    fastreid_config_person: str = Field(default="configs/msmt17_sbs_R101ibn_person.yml")
+    fastreid_config_vehicle: str = Field(default="configs/sbs_R50ibn_vehicle.yml")
+    model_name_person: str = Field(default="msmt17_sbs_R101-ibn")
+    model_name_vehicle: str = Field(default="sbs_R50-ibn_vehicle")
     embedding_dimension: int = Field(default=2048)
+
+    # Micro-batching dinámico para alto volumen en CPU (1000 cámaras)
+    batch_max_size: int = Field(default=12, description="Tamaño máximo de micro-batch de crops")
+    batch_window_ms: int = Field(default=15, description="Ventana de agrupación de crops en milisegundos")
+    cpu_threads: int = Field(default=2, description="Hilos intra-op de CPU por proceso para PyTorch/ONNX")
 
     # Detección de objetos (YOLO)
     detection_model_path: str = Field(
@@ -34,6 +45,10 @@ class Settings(BaseSettings):
     )
     detection_confidence: float = Field(
         default=0.4, description="Confianza mínima para aceptar una detección"
+    )
+    detection_fallback_confidence: float = Field(
+        default=0.15,
+        description="Confianza mínima en segundo intento con padding para crops cerrados",
     )
     detection_iou: float = Field(default=0.45, description="Umbral IoU para NMS")
     detection_person_class: int = Field(default=0, description="Clase COCO de persona")
@@ -52,8 +67,8 @@ class Settings(BaseSettings):
     request_timeout: int = Field(default=30, description="Timeout máximo por request en segundos")
 
     # Rate limiting
-    rate_limit_embed: str = Field(default="60/minute", description="Rate limit para endpoints /embed/*")
-    rate_limit_health: str = Field(default="120/minute", description="Rate limit para /health")
+    rate_limit_embed: str = Field(default="6000/minute", description="Rate limit para endpoints /embed/*")
+    rate_limit_health: str = Field(default="240/minute", description="Rate limit para /health")
 
     @property
     def max_image_bytes(self) -> int:

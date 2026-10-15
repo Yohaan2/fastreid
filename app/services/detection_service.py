@@ -11,7 +11,7 @@ import threading
 from dataclasses import dataclass
 from typing import Optional
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 from app.core.config import settings
 from app.core.logger import get_logger
@@ -31,6 +31,13 @@ class Detection:
     y2: int
     confidence: float
     class_id: int
+
+    @property
+    def object_type(self) -> str:
+        """Retorna 'person' o 'vehicle' según la clase COCO detectada."""
+        if self.class_id == settings.detection_person_class:
+            return "person"
+        return "vehicle"
 
 
 class DetectionService:
@@ -111,6 +118,65 @@ class DetectionService:
         """Detecta personas (cuerpo completo) en la imagen."""
         return self._detect(image, allowed_classes={settings.detection_person_class})
 
+    def detect_vehicles(self, image: Image.Image) -> list[Detection]:
+        """Detecta vehículos (car, motorcycle, bus, truck) en la imagen."""
+        return self._detect(image, allowed_classes=settings.vehicle_class_ids)
+
+    def detect_persons_and_vehicles(
+        self,
+        image: Image.Image,
+        enable_crop_fallback: bool = True,
+    ) -> list[Detection]:
+        """
+        Detecta tanto personas como vehículos en una sola pasada de YOLO.
+        Si no detecta ningún objeto (p. ej. el usuario subió un crop muy cerrado
+        donde el sujeto toca los bordes de la imagen), aplica un segundo intento
+        con 20% de padding negro y umbral reducido (`detection_fallback_confidence`).
+        """
+        allowed_classes = {settings.detection_person_class} | settings.vehicle_class_ids
+        detections = self._detect(
+            image,
+            allowed_classes=allowed_classes,
+            conf=settings.detection_confidence,
+            imgsz=640,
+        )
+        if detections or not enable_crop_fallback:
+            return detections
+
+        # Fallback para crops cerrados: añadir 20% de margen negro y bajar umbral
+        rgb = image.convert("RGB") if image.mode != "RGB" else image
+        width, height = rgb.size
+        pad_x = max(8, int(width * 0.20))
+        pad_y = max(8, int(height * 0.20))
+        padded = ImageOps.expand(rgb, border=(pad_x, pad_y, pad_x, pad_y), fill=(0, 0, 0))
+
+        retry_detections = self._detect(
+            padded,
+            allowed_classes=allowed_classes,
+            conf=settings.detection_fallback_confidence,
+            imgsz=640,
+        )
+        if not retry_detections:
+            return []
+
+        best = max(retry_detections, key=lambda d: d.confidence)
+        logger.info(
+            "detection_crop_fallback_matched",
+            object_type=best.object_type,
+            confidence=round(best.confidence, 4),
+            original_size=f"{width}x{height}",
+        )
+        return [
+            Detection(
+                x1=0,
+                y1=0,
+                x2=width,
+                y2=height,
+                confidence=best.confidence,
+                class_id=best.class_id,
+            )
+        ]
+
     # ------------------------------------------------------------------
     # Lógica interna
     # ------------------------------------------------------------------
@@ -119,19 +185,22 @@ class DetectionService:
         self,
         image: Image.Image,
         allowed_classes: set[int],
+        conf: Optional[float] = None,
+        imgsz: int = 320,
     ) -> list[Detection]:
         yolo_model = self.model
         if yolo_model is None:
             raise RuntimeError("Detector YOLO no disponible — modelo no cargado o pesos faltantes")
 
         rgb = image.convert("RGB") if image.mode != "RGB" else image
+        effective_conf = settings.detection_confidence if conf is None else conf
 
         results = yolo_model.predict(
             source=rgb,
-            conf=settings.detection_confidence,
+            conf=effective_conf,
             iou=settings.detection_iou,
             classes=list(allowed_classes),
-            imgsz=320,  # Reducir resolución para velocidad óptima en CPU
+            imgsz=imgsz,
             verbose=False,
         )
 
