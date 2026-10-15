@@ -11,6 +11,7 @@ Responsabilidades:
 
 NO conoce: cámaras, eventos, usuarios, zonas, base de datos.
 """
+import gc
 import os
 import time
 import threading
@@ -258,28 +259,11 @@ class FastReIDService:
             )
             if self._person_onnx_session is None:
                 logger.info("lazy_loading_model_started", label="person")
-                pt_model = self._load_single_model(
+                self._person_model = self._load_single_model(
                     config_path=settings.fastreid_config_person,
                     weights_path=settings.model_path_person,
                     label="person",
                 )
-                if pt_model is not None and settings.enable_onnx and self._device.type == "cpu":
-                    exported_path = self._export_pytorch_to_onnx(
-                        pt_model=pt_model,
-                        onnx_path=settings.model_onnx_path_person,
-                        height=PERSON_HEIGHT,
-                        width=PERSON_WIDTH,
-                        label="person",
-                    )
-                    if exported_path:
-                        self._person_onnx_session = self._try_load_onnx_session(
-                            exported_path, "person"
-                        )
-                # Si ONNX cargó con éxito, liberamos el modelo PyTorch para ahorrar RAM
-                if self._person_onnx_session is not None:
-                    self._person_model = None
-                else:
-                    self._person_model = pt_model
             self._person_load_attempted = True
 
     def _ensure_vehicle_loaded(self) -> None:
@@ -293,27 +277,11 @@ class FastReIDService:
             )
             if self._vehicle_onnx_session is None:
                 logger.info("lazy_loading_model_started", label="vehicle")
-                pt_model = self._load_single_model(
+                self._vehicle_model = self._load_single_model(
                     config_path=settings.fastreid_config_vehicle,
                     weights_path=settings.model_path_vehicle,
                     label="vehicle",
                 )
-                if pt_model is not None and settings.enable_onnx and self._device.type == "cpu":
-                    exported_path = self._export_pytorch_to_onnx(
-                        pt_model=pt_model,
-                        onnx_path=settings.model_onnx_path_vehicle,
-                        height=VEHICLE_HEIGHT,
-                        width=VEHICLE_WIDTH,
-                        label="vehicle",
-                    )
-                    if exported_path:
-                        self._vehicle_onnx_session = self._try_load_onnx_session(
-                            exported_path, "vehicle"
-                        )
-                if self._vehicle_onnx_session is not None:
-                    self._vehicle_model = None
-                else:
-                    self._vehicle_model = pt_model
             self._vehicle_load_attempted = True
 
     @property
@@ -379,9 +347,15 @@ class FastReIDService:
             model = build_model(cfg)
 
             # Compatibilidad entre checkpoints FastReID v0.1 (`heads.bnneck.*`)
-            # y FastReID master (`heads.bottleneck.0.*`)
-            ckpt = torch.load(weights_path, map_location=self._device, weights_only=False)
-            state_dict = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
+            # y FastReID master (`heads.bottleneck.0.*`), liberando el optimizer del checkpoint
+            ckpt = torch.load(weights_path, map_location="cpu", weights_only=False)
+            if isinstance(ckpt, dict) and "model" in ckpt:
+                state_dict = ckpt.pop("model")
+                ckpt.clear()
+            else:
+                state_dict = ckpt
+            del ckpt
+
             model_keys = set(model.state_dict().keys())
 
             if isinstance(state_dict, dict):
@@ -400,9 +374,12 @@ class FastReIDService:
                 ]
                 if missing:
                     logger.warning("checkpoint_missing_keys", label=label, missing=missing)
+                state_dict.clear()
+                del state_dict
             else:
                 Checkpointer(model).load(weights_path)
 
+            gc.collect()
             model.eval()
             model.to(self._device)
 
