@@ -615,8 +615,14 @@ class FastReIDService:
             raw_np = ort_outs[0]
             features = torch.from_numpy(np.asarray(raw_np, dtype=np.float32))
         elif model is not None:
+            # El tensor ya viene normalizado con ImageNet mean/std; se omite
+            # Baseline.preprocess_image para no normalizarlo dos veces.
             with torch.inference_mode():
-                output = model(batch_tensor.to(self._device))
+                x = batch_tensor.to(self._device)
+                if hasattr(model, "backbone") and hasattr(model, "heads"):
+                    output = model.heads(model.backbone(x))
+                else:
+                    output = model(x)
             features = output["features"] if isinstance(output, dict) else output
             features = features.detach().cpu()
         else:
