@@ -224,7 +224,9 @@ class DetectionService:
                 ix2 = min(width, int(x2))
                 iy2 = min(height, int(y2))
                 
-                if ix2 <= ix1 or iy2 <= iy1:
+                # Descartar objetos diminutos (p. ej. autos lejanos de 10x6 px): su embedding
+                # es ruido y Perceiver tampoco enrola crops por debajo de este tamaño.
+                if (ix2 - ix1) < settings.min_image_width or (iy2 - iy1) < settings.min_image_height:
                     continue
                 detections.append(
                     Detection(
